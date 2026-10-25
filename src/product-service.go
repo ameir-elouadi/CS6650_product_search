@@ -7,8 +7,11 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
@@ -20,11 +23,18 @@ import (
 
 type Product struct {
 	ProductID    *int32  `json:"product_id" binding:"required,min=1"`
+	Name         *string `json:"name,omitempty" binding:"omitempty,max=200"`
 	SKU          *string `json:"sku" binding:"required,min=1,max=100"`
 	Manufacturer *string `json:"manufacturer" binding:"required,min=1,max=200"`
 	CategoryID   *int32  `json:"category_id" binding:"required,min=1"`
 	Weight       *int32  `json:"weight" binding:"required,min=0"`
 	SomeOtherID  *int32  `json:"some_other_id" binding:"required,min=1"`
+}
+
+type SearchResult struct {
+	Products   []Product `json:"products"`
+	TotalFound int32     `json:"total_found"`
+	SearchTime string    `json:"search_time,omitempty"`
 }
 
 type Error struct {
@@ -37,8 +47,28 @@ type Error struct {
 
 var (
 	products = map[int32]Product{}
-	mu       sync.RWMutex
+	// Insertion order of product IDs, so a search can walk a fixed-size window of the catalog
+	productIDs []int32
+	mu         sync.RWMutex
 )
+
+// Search tuning
+
+const (
+	numProducts       = 100_000
+	productsPerSearch = 100 // fixed work per request: every search checks exactly this many products
+	maxSearchResults  = 20
+	maxQueryLength    = 100
+)
+
+// Products only carry category IDs; category ID n maps to categories[(n-1) % len(categories)]
+var (
+	categories = []string{"Electronics", "Books", "Home", "Garden", "Toys", "Sports", "Clothing", "Beauty", "Automotive", "Grocery"}
+	brands     = []string{"Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Omega", "Nova", "Apex", "Vertex"}
+)
+
+// Rotates each search's starting point so successive searches cover the whole catalog
+var searchCursor atomic.Uint64
 
 // Observability: RED signals (rate, errors, duration) per endpoint
 
@@ -59,6 +89,12 @@ var (
 		// 50µs to ~1.6s: requests take well under the default buckets' 5ms minimum
 		Buckets: prometheus.ExponentialBuckets(0.00005, 2, 16),
 	}, []string{"method", "endpoint"})
+
+	// Every search should add exactly productsPerSearch; rate(checked) / rate(searches) verifies it
+	productsCheckedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "search_products_checked_total",
+		Help: "Products examined by /products/search.",
+	})
 
 	logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
 )
@@ -97,7 +133,42 @@ func observe(c *gin.Context) {
 	logger.Info("request", attrs...)
 }
 
+// Data generation
+
+func ptr[T any](v T) *T { return &v }
+
+// generateProducts fills the store with numProducts products named "Product <Brand> <ID>".
+func generateProducts() {
+	productIDs = make([]int32, 0, numProducts)
+	for i := int32(1); i <= numProducts; i++ {
+		// Brand advances once per full category cycle, so brands and categories don't move in lockstep
+		brand := brands[int(i)/len(categories)%len(brands)]
+		products[i] = Product{
+			ProductID:    ptr(i),
+			Name:         ptr(fmt.Sprintf("Product %s %d", brand, i)),
+			SKU:          ptr(fmt.Sprintf("SKU-%06d", i)),
+			Manufacturer: ptr(brand + " Corporation"),
+			CategoryID:   ptr(i%int32(len(categories)) + 1),
+			Weight:       ptr(i % 5000),
+			SomeOtherID:  ptr(i%1000 + 1),
+		}
+		productIDs = append(productIDs, i)
+	}
+}
+
 // Helpers
+
+func categoryName(id int32) string {
+	return categories[int(id-1)%len(categories)]
+}
+
+// matches reports whether lowerQuery appears in the product's name or category name, ignoring case.
+func matches(p Product, lowerQuery string) bool {
+	if p.Name != nil && strings.Contains(strings.ToLower(*p.Name), lowerQuery) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(categoryName(*p.CategoryID)), lowerQuery)
+}
 
 func parseProductID(c *gin.Context) (int32, bool) {
 	id, err := strconv.ParseInt(c.Param("productId"), 10, 32)
@@ -144,10 +215,49 @@ func addProductDetails(c *gin.Context) {
 	}
 
 	mu.Lock()
+	if _, exists := products[id]; !exists {
+		productIDs = append(productIDs, id)
+	}
 	products[id] = product
 	mu.Unlock()
 
 	c.Status(http.StatusNoContent)
+}
+
+func searchProducts(c *gin.Context) {
+	start := time.Now()
+
+	query, present := c.GetQuery("q")
+	if !present || query == "" {
+		c.JSON(http.StatusBadRequest, Error{"INVALID_INPUT", "The provided input data is invalid", "query parameter q is required"})
+		return
+	}
+	if utf8.RuneCountInString(query) > maxQueryLength {
+		c.JSON(http.StatusBadRequest, Error{"INVALID_INPUT", "The provided input data is invalid", "query parameter q must be at most 100 characters"})
+		return
+	}
+	lowerQuery := strings.ToLower(query)
+
+	// Check exactly productsPerSearch products, even after maxSearchResults are found, so every search costs the same
+	results := make([]Product, 0, maxSearchResults)
+	checked := 0
+	mu.RLock()
+	n := len(productIDs)
+	offset := int(searchCursor.Add(productsPerSearch) % uint64(n))
+	for ; checked < productsPerSearch && checked < n; checked++ {
+		p := products[productIDs[(offset+checked)%n]]
+		if matches(p, lowerQuery) && len(results) < maxSearchResults {
+			results = append(results, p)
+		}
+	}
+	mu.RUnlock()
+	productsCheckedTotal.Add(float64(checked))
+
+	c.JSON(http.StatusOK, SearchResult{
+		Products:   results,
+		TotalFound: int32(len(results)),
+		SearchTime: time.Since(start).String(),
+	})
 }
 
 // Main
@@ -155,6 +265,7 @@ func addProductDetails(c *gin.Context) {
 func main() {
 	// Release mode keeps Gin's debug lines out of stdout, so every log line is JSON
 	gin.SetMode(gin.ReleaseMode)
+	generateProducts()
 	r := gin.New()
 
 	// Scraped by Prometheus; registered before the middleware so scrapes aren't counted as traffic
@@ -172,6 +283,7 @@ func main() {
 		}
 	})
 
+	r.GET("/products/search", searchProducts)
 	r.GET("/products/:productId", getProduct)
 	r.POST("/products/:productId/details", addProductDetails)
 

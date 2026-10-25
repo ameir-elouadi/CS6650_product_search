@@ -1,0 +1,10 @@
+q=electro http=200 total_seconds=0.001525 total_found= 10  search_time= 129.609µs
+q=books http=200 total_seconds=0.001473 total_found= 10  search_time= 101.695µs
+q=alpha http=200 total_seconds=0.001519 total_found= 10  search_time= 99.467µs
+q=zzz http=200 total_seconds=0.001523 total_found= 0  search_time= 102.748µs
+before: search_products_checked_total 3.4306e+06
+after: search_products_checked_total 3.431e+06
+
+
+4 searches -> products checked rose by exactly 400 (100 per search)
+Run from EC2 t3.medium in us-west-2 against the task private IP

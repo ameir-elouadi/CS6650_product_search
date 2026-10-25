@@ -5,3 +5,8 @@ scrape_configs:
   - job_name: product-api
     static_configs:
       - targets: ["app:8080"]
+
+  # The deployed ECS task. Write its public IP into targets/ecs.json, e.g. [{"targets": ["<ip>:8080"]}]
+  - job_name: product-api-ecs
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/*.json"]

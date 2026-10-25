@@ -18,3 +18,4 @@ __pycache__/
 locust/*.log
 locust/results/
 observability/logs/*.jsonl
+observability/targets/
