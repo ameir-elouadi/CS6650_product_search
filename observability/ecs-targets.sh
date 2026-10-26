@@ -8,7 +8,7 @@ while true; do
   TASKS=$(aws ecs list-tasks --cluster $CLUSTER --service-name $SERVICE --desired-status RUNNING --query 'taskArns' --output text)
   ENIS=""
   [ -n "$TASKS" ] && ENIS=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASKS \
-    --query "tasks[?lastStatus=='RUNNING'].attachments[0].details[?name=='networkInterfaceId'].value[]" --output text)
+    --query "tasks[?lastStatus=='RUNNING'].attachments[].details[?name=='networkInterfaceId'].value[]" --output text)
   IPS=""
   [ -n "$ENIS" ] && IPS=$(aws ec2 describe-network-interfaces --network-interface-ids $ENIS \
     --query 'NetworkInterfaces[].Association.PublicIp' --output text)

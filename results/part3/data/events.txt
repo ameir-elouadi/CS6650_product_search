@@ -1,0 +1,6 @@
+14:37:31 core test started (approx)
+14:49:32 stopped 1 task: 3cd0d67bd46e4302ab75f454d947848a (running before: 2)
+14:53:34 stopped task 1e326b2665a9443cb06f0a66d1798b75 (multi-stop)
+14:53:35 stopped task 8597d0892e4b43178e1e4fa5266f108a (multi-stop)
+14:59:23 health check path -> /does-not-exist (all targets will fail)
+15:03:23 health check path -> /health (restored)

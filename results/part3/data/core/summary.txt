@@ -1,0 +1,28 @@
+[2026-10-26 14:37:33,032] ip-172-31-37-247/INFO/locust.main: Starting Locust 2.47.0
+[2026-10-26 14:37:33,072] ip-172-31-37-247/INFO/locust.runners: ip-172-31-37-247.us-west-2.compute.internal_d0649948958d48eca545545ef4549e78 (index 0) reported as ready. 1 workers connected.
+[2026-10-26 14:37:33,072] ip-172-31-37-247/INFO/locust.runners: ip-172-31-37-247.us-west-2.compute.internal_133480d9351246789ec20c36f56d1123 (index 1) reported as ready. 2 workers connected.
+[2026-10-26 14:37:34,068] ip-172-31-37-247/INFO/locust.main: Run time limit set to 1200 seconds
+[2026-10-26 14:37:34,068] ip-172-31-37-247/INFO/locust.runners: Sending spawn jobs of 20 users at 20.00 spawn rate to 2 ready workers
+[2026-10-26 14:37:34,212] ip-172-31-37-247/INFO/locust.runners: All users spawned: {"SearchUser": 20} (20 total users)
+[2026-10-26 14:57:34,068] ip-172-31-37-247/INFO/locust.main: --run-time limit reached, shutting down
+[2026-10-26 14:57:34,069] ip-172-31-37-247/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-10-26 14:57:34,070] ip-172-31-37-247/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-10-26 14:57:34,115] ip-172-31-37-247/INFO/locust.main: Shutting down (exit code 0)
+[2026-10-26 14:57:34,115] ip-172-31-37-247/INFO/locust.runners: Worker 'ip-172-31-37-247.us-west-2.compute.internal_d0649948958d48eca545545ef4549e78' (index 0) quit. 0 workers ready.
+[2026-10-26 14:57:34,115] ip-172-31-37-247/INFO/locust.main: Shutting down (exit code 0)
+[2026-10-26 14:57:34,129] ip-172-31-37-247/INFO/locust.runners: Worker 'ip-172-31-37-247.us-west-2.compute.internal_133480d9351246789ec20c36f56d1123' (index 1) quit. 0 workers ready.
+[2026-10-26 14:57:34,129] ip-172-31-37-247/INFO/locust.runners: The last worker quit, stopping test.
+[2026-10-26 14:57:35,151] ip-172-31-37-247/INFO/locust.main: Shutting down (exit code 0)
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+GET      /products/search                                                             2116975     0(0.00%) |      5       0     373      2 | 1764.08        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                   2116975     0(0.00%) |      5       0     373      2 | 1764.08        0.00
+
+Response time percentiles (approximated)
+Type     Name                                                                                  50%    66%    75%    80%    90%    95%    98%    99%  99.9% 99.99%   100% # reqs
+--------|--------------------------------------------------------------------------------|--------|------|------|------|------|------|------|------|------|------|------|------
+GET      /products/search                                                                        2      2      3      3      5     35     56     75    170    190    370 2116975
+--------|--------------------------------------------------------------------------------|--------|------|------|------|------|------|------|------|------|------|------|------
+         Aggregated                                                                              2      2      3      3      5     35     56     75    170    190    370 2116975
+
