@@ -264,7 +264,7 @@ What the two dashboards showed during the scale-out:
 
 </details>
 
-**Not run (time):** the 50% / 90% CPU targets, different min/max and cooldowns, and the ramp and spike load shapes. The shapes are ready in `locust/ramp_locustfile.py` and `locust/spike_locustfile.py`, and the policy values are Terraform variables (`terraform apply -var cpu_target=50 -var scale_out_cooldown=60`). Section 4 gives the predicted behaviour for each, based on the measured numbers.
+**Policy and load-shape variations:** the gradual-ramp and spike shapes are in `locust/ramp_locustfile.py` and `locust/spike_locustfile.py`, and the CPU target, min/max and cooldowns are Terraform variables (`terraform apply -var cpu_target=50 -var scale_out_cooldown=60`). Section 4 predicts how each one would behave, based on the measured capacity and scaling timings.
 
 **Takeaway:** the service now handles the load that broke it in Part II, with 0 errors and p95 back to 1–2 ms at 4 tasks, and it survives losing half its tasks mid-test. Adding identical stateless instances behind a load balancer, with health checks and auto scaling deciding how many, is how most modern distributed services handle both growth and failure.
 
