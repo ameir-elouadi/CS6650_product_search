@@ -1,6 +1,12 @@
 # ECS Cluster
 resource "aws_ecs_cluster" "this" {
   name = "${var.service_name}-cluster"
+
+  # Per-task CPU and desired/running task counts in CloudWatch (ECS/ContainerInsights)
+  setting {
+    name  = "containerInsights"
+    value = "enhanced"
+  }
 }
 
 # Task Definition
@@ -43,8 +49,23 @@ resource "aws_ecs_service" "this" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets         = var.subnet_ids
-    security_groups = var.security_group_ids
+    subnets          = var.subnet_ids
+    security_groups  = var.security_group_ids
     assign_public_ip = true
+  }
+
+  # Register every task in the ALB target group
+  load_balancer {
+    target_group_arn = var.target_group_arn
+    container_name   = "${var.service_name}-container"
+    container_port   = var.container_port
+  }
+
+  # Startup generates 100,000 products; don't judge health until it's had time
+  health_check_grace_period_seconds = 60
+
+  # Auto scaling owns the task count after the first deploy
+  lifecycle {
+    ignore_changes = [desired_count]
   }
 }

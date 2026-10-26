@@ -1,4 +1,4 @@
-# Wire together four focused modules: network, ecr, logging, ecs.
+# Wire together focused modules: network, ecr, logging, alb, ecs, autoscaling, monitoring.
 
 module "network" {
   source         = "./modules/network"
@@ -17,6 +17,16 @@ module "logging" {
   retention_in_days = var.log_retention_days
 }
 
+module "alb" {
+  source            = "./modules/alb"
+  service_name      = var.service_name
+  vpc_id            = module.network.vpc_id
+  subnet_ids        = module.network.subnet_ids
+  security_group_id = module.network.alb_security_group_id
+  container_port    = var.container_port
+  health_check_path = var.health_check_path
+}
+
 # Reuse an existing IAM role for ECS tasks
 data "aws_iam_role" "lab_role" {
   name = "LabRole"
@@ -32,11 +42,34 @@ module "ecs" {
   execution_role_arn = data.aws_iam_role.lab_role.arn
   task_role_arn      = data.aws_iam_role.lab_role.arn
   log_group_name     = module.logging.log_group_name
-  ecs_count          = var.ecs_count
+  ecs_count          = var.min_tasks
   region             = var.aws_region
+  target_group_arn   = module.alb.target_group_arn
 
   # Start the service only after the image is in ECR
   depends_on = [docker_registry_image.app]
+}
+
+module "autoscaling" {
+  source             = "./modules/autoscaling"
+  cluster_name       = module.ecs.cluster_name
+  service_name       = module.ecs.service_name
+  min_tasks          = var.min_tasks
+  max_tasks          = var.max_tasks
+  cpu_target         = var.cpu_target
+  scale_out_cooldown = var.scale_out_cooldown
+  scale_in_cooldown  = var.scale_in_cooldown
+}
+
+module "monitoring" {
+  source                  = "./modules/monitoring"
+  service_name            = var.service_name
+  cluster_name            = module.ecs.cluster_name
+  alb_arn_suffix          = module.alb.arn_suffix
+  target_group_arn_suffix = module.alb.target_group_arn_suffix
+  alarm_arns              = module.autoscaling.alarm_names
+  cpu_target              = var.cpu_target
+  region                  = var.aws_region
 }
 
 

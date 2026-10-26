@@ -19,3 +19,4 @@ locust/*.log
 locust/results/
 observability/logs/*.jsonl
 observability/targets/
+loadgen/.state

@@ -33,3 +33,37 @@ resource "aws_security_group" "this" {
     description = "Allow all outbound"
   }
 }
+
+# Security group for the load balancer: HTTP from anywhere
+resource "aws_security_group" "alb" {
+  name        = "${var.service_name}-alb-sg"
+  description = "Allow inbound HTTP to the ALB"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow HTTP from anywhere"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all outbound"
+  }
+}
+
+# Let the ALB reach the tasks on the container port (health checks and traffic)
+resource "aws_security_group_rule" "alb_to_tasks" {
+  type                     = "ingress"
+  from_port                = var.container_port
+  to_port                  = var.container_port
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.this.id
+  source_security_group_id = aws_security_group.alb.id
+  description              = "ALB to tasks"
+}

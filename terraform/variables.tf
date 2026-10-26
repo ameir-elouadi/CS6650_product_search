@@ -20,9 +20,36 @@ variable "container_port" {
   default = 8080
 }
 
-variable "ecs_count" {
+# Auto scaling (target tracking on average service CPU)
+variable "min_tasks" {
   type    = number
-  default = 1
+  default = 2
+}
+
+variable "max_tasks" {
+  type    = number
+  default = 4
+}
+
+variable "cpu_target" {
+  type    = number
+  default = 70
+}
+
+variable "scale_out_cooldown" {
+  type    = number
+  default = 300
+}
+
+variable "scale_in_cooldown" {
+  type    = number
+  default = 300
+}
+
+# Path the ALB health check polls on every task
+variable "health_check_path" {
+  type    = string
+  default = "/health"
 }
 
 # How long to keep logs

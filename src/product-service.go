@@ -268,8 +268,11 @@ func main() {
 	generateProducts()
 	r := gin.New()
 
-	// Scraped by Prometheus; registered before the middleware so scrapes aren't counted as traffic
+	// Scraped by Prometheus and polled by the ALB; registered before the middleware so neither counts as traffic
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
 
 	r.Use(observe)
 	// The panic goes into the request's JSON log line instead of a stack trace
