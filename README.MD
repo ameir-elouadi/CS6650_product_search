@@ -1,100 +1,98 @@
-# Product Search Service: load testing, horizontal scaling and auto scaling on ECS Fargate
+# Product Search Service: Load Testing and Scaling on ECS Fargate
 
-A Go + Gin product service with a fixed-cost search endpoint, deployed to one small ECS Fargate task with Terraform. It's load tested with Locust and observed two ways at once: the Homework 5 Prometheus/Grafana dashboard and CloudWatch.
+This is a Go + Gin product service with a search endpoint that does a fixed amount of work per request. I deployed it to ECS Fargate with Terraform, load tested it with Locust, and watched it with both my Homework 5 Prometheus/Grafana dashboard and CloudWatch. Part II finds where a single task breaks. Part III puts it behind a load balancer with auto scaling.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/products/search?q={query}` | **New.** Case-insensitive match on name or category, checks exactly 100 products, returns ≤ 20 |
+| `GET` | `/products/search?q={query}` | New. Case-insensitive match on name or category, checks exactly 100 products, returns at most 20 |
 | `GET` | `/products/{productId}` | From Homework 5 |
 | `POST` | `/products/{productId}/details` | From Homework 5 |
+| `GET` | `/health` | Health check for the load balancer (Part III) |
 | `GET` | `/metrics` | Prometheus metrics |
 
-**Contents:** [Part II report](#report) · [Part III: horizontal scaling](#part-iii-horizontal-scaling-with-auto-scaling) · [Where everything is](#where-everything-is) · [Deploy](#deploy) · [Search requests](#search-requests) · [Run the load tests](#run-the-load-tests) · [Observability](#observability) · [Clean up](#clean-up) · [Troubleshooting](#troubleshooting)
+**Contents:** [Part II: finding the breaking point](#part-ii-finding-the-breaking-point) · [Part III: horizontal scaling](#part-iii-horizontal-scaling-with-auto-scaling) · [Where everything is](#where-everything-is) · [Deploy](#deploy) · [Search requests](#search-requests) · [Run the load tests](#run-the-load-tests) · [Observability](#observability) · [Clean up](#clean-up) · [Troubleshooting](#troubleshooting)
 
 ---
 
-## Report
-
-*Part II: one task, finding the breaking point.*
+## Part II: Finding the breaking point
 
 ### Setup
 
 | | |
 |---|---|
-| Service | ECS Fargate, **256 CPU units (0.25 vCPU), 512 MB, 1 task**, us-west-2 |
-| Data | 100,000 products generated at startup: name `Product <Brand> <ID>`, category rotated by modulo through 10 names |
-| Work per request | Exactly **100 products checked** per search (a rotating window over the catalog), single-threaded, ≤ 20 results returned |
-| Load | Locust `FastHttpUser`, 12 common terms (`electronics`, `books`, `alpha`, `product`, …), 0–10 ms wait |
-| Load generator | EC2 `t3.medium` in us-west-2, hitting the task's private IP (first attempt: laptop, see [Creative stress testing](#5-creative-stress-testing)) |
-| Observability | HW5 Grafana dashboard (Prometheus scrapes the task's `/metrics` every 5 s) **and** CloudWatch `AWS/ECS` service metrics, plus CloudWatch Logs |
+| Service | ECS Fargate, 256 CPU units (0.25 vCPU), 512 MB, 1 task, us-west-2 |
+| Data | 100,000 products generated at startup, named `Product <Brand> <ID>`, with categories rotated by modulo through 10 names |
+| Work per request | Each search checks exactly 100 products (a rotating window over the catalog), single-threaded, and returns at most 20 |
+| Load | Locust `FastHttpUser` searching 12 common terms (`electronics`, `books`, `alpha`, `product`, …) with a 0–10 ms wait |
+| Load generator | EC2 `t3.medium` in us-west-2, hitting the task's private IP. My first attempt was from my laptop (see [creative stress testing](#5-creative-stress-testing)) |
+| Monitoring | HW5 Grafana dashboard (Prometheus scrapes `/metrics` every 5 s), CloudWatch `AWS/ECS` service metrics, and CloudWatch Logs |
 
-**Verification with single searches** (from the EC2 instance, [`results/data/verification_single_search.txt`](results/data/verification_single_search.txt)): ~1.5 ms end to end, ~0.1 ms inside the handler (well under the 20 ms target). Four searches raised `search_products_checked_total` by exactly 400. One user alone already drives the task to ~23% CPU.
+Before load testing I checked single searches from the EC2 instance ([`verification_single_search.txt`](results/data/verification_single_search.txt)). Each took about 1.5 ms end to end and about 0.1 ms inside the handler, well under the 20 ms target. Four searches raised the `search_products_checked_total` counter by exactly 400, which confirmed 100 products per search. A single user was already enough to push the task to about 23% CPU.
 
 ### Results
 
 | Test | Users | Duration | Requests | Failures | req/s | p50 | p95 | p99 | CloudWatch CPU (avg) | CloudWatch memory |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 1: baseline | 5 | 2 min | 85,370 | 0 | 712 | 1 ms | 1 ms | 5 ms | **~77%** | 10.6% (flat) |
-| 2: breaking point | 20 | 3 min | 191,421 | 0 | 1,065 | 1 ms | **66 ms** | **87 ms** | **~97–99%** | 10.8% (flat) |
+| 1: baseline | 5 | 2 min | 85,370 | 0 | 712 | 1 ms | 1 ms | 5 ms | ~77% | 10.6% (flat) |
+| 2: breaking point | 20 | 3 min | 191,421 | 0 | 1,065 | 1 ms | 66 ms | 87 ms | ~97–99% | 10.8% (flat) |
 | 3: step load | 1 → 40 | 3.5 min | 144,567 | 0 | 688 | 1 ms | 75 ms | 89 ms | 23% → 100% | flat |
 
 ![HW5 Grafana dashboard and CloudWatch side by side across Test 1 and Test 2](results/screenshots/both_tests_side_by_side.png)
 
 ### 1. What happened when load increased
 
-- **5 users: moderate CPU, fast responses.** 712 req/s at ~77% CPU, p99 5 ms.
-- **20 users: CPU saturated, responses degraded.** 4× the users gave only **1.5× the throughput** (1,065 req/s). CPU sat at 97–99%, and p90/p95/p99 jumped to 62/66/87 ms. Nothing failed; requests got slower.
-- **The step test shows where it breaks** ([`test3_step_by_step.csv`](results/data/ec2/test3_step_by_step.csv)):
+With 5 users the task ran at about 77% CPU and served 712 req/s with a p99 of 5 ms. With 20 users, 4× the users only got 1.5× the throughput (1,065 req/s). CPU sat at 97–99% and p90/p95/p99 jumped to 62/66/87 ms. Nothing failed; requests just got slower.
 
-  | Users | 1 | 2 | 3 | 5 | 10 | 20 | 40 |
-  |---|---|---|---|---|---|---|---|
-  | req/s | 145 | 296 | 423 | 721 | 892 | 1,069 | 1,151 |
-  | CPU | 23% | 38% | 53% | 77% | 95% | 99% | 100% |
-  | p95 | 1 ms | 1 ms | 1 ms | 1 ms | 2 ms | 30 ms | 70 ms |
+The step test ([`test3_step_by_step.csv`](results/data/ec2/test3_step_by_step.csv)) shows where it breaks:
 
-  Throughput grows linearly (~145 req/s per user) until about 5–10 users. After that it flattens at **~1,100–1,150 req/s**, and every extra user only adds latency: going from 20 to 40 users bought 8% more throughput and 2.3× the p95.
-- **Why the latency jumps to ~65 ms specifically:** a 0.25 vCPU task gets 25 ms of CPU per 100 ms. Once that's used, Fargate pauses the whole process for the rest of the period. The request logs show it directly: at ~1,000 req/s, consecutive log lines have **~65 ms gaps with nothing in between** ([`request_logs.md`](results/data/request_logs.md)).
-- **Memory didn't move:** 10.5–10.8% of 512 MB (~68 MiB RSS) throughout, because all products are loaded at startup.
+| Users | 1 | 2 | 3 | 5 | 10 | 20 | 40 |
+|---|---|---|---|---|---|---|---|
+| req/s | 145 | 296 | 423 | 721 | 892 | 1,069 | 1,151 |
+| CPU | 23% | 38% | 53% | 77% | 95% | 99% | 100% |
+| p95 | 1 ms | 1 ms | 1 ms | 1 ms | 2 ms | 30 ms | 70 ms |
+
+Throughput grows linearly, about 145 req/s per user, up to 5–10 users. Then it flattens around 1,100–1,150 req/s, and extra users only add latency. Going from 20 to 40 users gave 8% more throughput and more than doubled p95.
+
+The ~65 ms latency has a specific cause. A 0.25 vCPU task gets 25 ms of CPU in every 100 ms period, and once it uses that, Fargate pauses the whole process until the next period. I could see this in the request logs ([`request_logs.md`](results/data/request_logs.md)): even at ~1,000 req/s, consecutive log lines had ~65 ms gaps with nothing in between.
+
+Memory stayed at 10.5–10.8% of 512 MB (about 68 MiB) the whole time, since all the products are generated at startup.
 
 ### 2. Optimization or scaling? The evidence
 
-| Evidence | Where it came from | What it says |
+| Evidence | Source | What it means |
 |---|---|---|
-| Work per request is constant: products checked/search = **100** in every test | Grafana panel from `search_products_checked_total` | The code isn't doing more work under load |
-| Time *inside* the handler is unchanged: p50 0.107 → 0.110 ms, p99 0.26 → 0.39 ms from 5 to 20 users | CloudWatch Logs Insights over every request | The search didn't get slower |
-| Client p95 rose 1 → 66 ms while the handler stayed < 0.4 ms | Locust vs. Prometheus/Logs | The extra time is *waiting for CPU*, not computing |
-| CPU pinned at 99–100% while throughput plateaus at ~1,100 req/s | CloudWatch CPUUtilization + step test | The task is out of CPU |
+| Products checked per search was 100 in every test | Grafana panel from `search_products_checked_total` | The code wasn't doing more work under load |
+| Time inside the handler barely changed from 5 to 20 users: p50 0.107 → 0.110 ms, p99 0.26 → 0.39 ms | CloudWatch Logs Insights over every request | The search itself didn't get slower |
+| Client p95 went from 1 to 66 ms while the handler stayed under 0.4 ms | Locust vs. Prometheus and the logs | The extra time is spent waiting for CPU, not computing |
+| CPU pinned at 99–100% while throughput leveled off at ~1,100 req/s | CloudWatch CPUUtilization and the step test | The task is out of CPU |
 | Memory flat at ~10% | CloudWatch MemoryUtilization | Not a memory problem |
-| CPU cost per request is roughly constant (~0.09% CPU per req/s at load) | CPU ÷ req/s per step | Capacity scales with CPU, so adding CPU adds throughput |
+| CPU cost per request roughly constant (~0.09% CPU per req/s under load) | CPU ÷ req/s at each step | More CPU should mean proportionally more throughput |
 
-**Verdict: scaling.** The algorithm is fixed by design (100 checks per search, as with model inference or video frames), and per-request cost doesn't degrade with load. Optimizing constant overhead (JSON encoding, `ToLower` allocations) could raise the ceiling somewhat, but demand grows linearly at ~145 req/s per user, so any fixed ceiling gets hit again. The fix is more CPU: more tasks (horizontal) or a bigger task (vertical).
+I concluded this needs scaling, not optimization. The search does a fixed 100 checks by design (like running a model or processing a video frame), and the cost per request doesn't grow with load. I could shave some constant overhead, like JSON encoding or the `ToLower` allocations, but demand grows by about 145 req/s per user, so any fixed ceiling gets hit again. The real fix is more CPU, either more tasks (horizontal) or a bigger task (vertical).
 
-### 3. Using CloudWatch metrics to make scaling decisions
+### 3. Using CloudWatch metrics to make a scaling decision
 
-- **Capacity per task** (from CloudWatch CPU against measured throughput): **~1,100 req/s at 100% CPU**, so ~770 req/s at a 70% target.
-- **Demand:** unthrottled, each user sends ~145 req/s. Test 2's 20 users want **~2,900 req/s**.
-- **Tasks needed** = demand ÷ capacity at target = 2,900 ÷ 770 ≈ **4 tasks** at 70% CPU (3 would run at ~88%).
-- **The trigger:** I created a CloudWatch alarm on the service, `CS6650-search-cpu-high` (average `CPUUtilization` > 70% for one 1-minute period). During the step test it **went into ALARM** on the 18:48 datapoint (96% average, the 10–20 user steps). This is the signal ECS Service Auto Scaling (target tracking on `ECSServiceAverageCPUUtilization` = 70%) uses to add tasks.
-- **Reaction time matters:** the alarm fired at 18:51:53, about 4 minutes after CPU crossed 70%, because ECS metrics are 1-minute averages published with a delay. For spiky traffic, scale out at a lower threshold or keep spare capacity rather than relying on the alarm alone.
+From CloudWatch CPU against the throughput I measured, one task tops out around 1,100 req/s at 100% CPU, or about 770 req/s at a 70% target. Each user sends about 145 req/s when it isn't being throttled, so Test 2's 20 users want roughly 2,900 req/s. At a 70% target that's 2,900 ÷ 770 ≈ 4 tasks (3 tasks would run at about 88%).
 
-  ![CloudWatch CPU during the step test with the 70% alarm threshold](results/screenshots/test3_step_cloudwatch_alarm.png)
+To test this as a real trigger, I created a CloudWatch alarm, `CS6650-search-cpu-high`, that fires when average service `CPUUtilization` is over 70% for one minute. That's the same signal ECS Service Auto Scaling uses with target tracking. During the step test it went into ALARM on the 18:48 datapoint (96%, during the 10–20 user steps).
 
-- **Don't scale on memory:** it stays at ~10%, so memory isn't a useful scaling signal for this service.
-- **Caveat:** each task here has its own public IP, so adding tasks only helps once a load balancer spreads traffic across them. That's the next step for horizontal scaling.
+![CloudWatch CPU during the step test with the 70% alarm threshold](results/screenshots/test3_step_cloudwatch_alarm.png)
+
+The alarm fired at 18:51:53, about 4 minutes after CPU crossed 70%, because ECS metrics are 1-minute averages that arrive late. For spiky traffic I'd use a lower threshold or keep spare capacity instead of relying on the alarm alone. Memory stayed around 10%, so it isn't a useful scaling signal for this service. One catch: each task had its own public IP at this point, so extra tasks wouldn't help until something spread traffic across them. That's what Part III adds.
 
 ### 4. HW5 dashboard vs. CloudWatch, side by side
 
-Same Test 2 window (20 users). Grafana is on the left, CloudWatch on the right:
+Same Test 2 window (20 users), with Grafana on the left and CloudWatch on the right:
 
 ![Test 2: Grafana and CloudWatch side by side](results/screenshots/test2_20u_side_by_side.png)
 
 | | HW5 Grafana dashboard (Prometheus) | CloudWatch |
 |---|---|---|
-| **What it showed that the other didn't** | Request rate, error %, **latency percentiles inside the handler**, errors by status, **products checked per search**. This is the app's own view: the search stayed at ~0.1 ms and always checked 100 products. | **CPU and memory relative to the task's Fargate reservation** (0.25 vCPU, 512 MB), measured by the platform rather than my code. Memory at 10% of the limit (Grafana only shows 68 MiB RSS, not how close that is to 512 MB). **Alarms** that can drive auto scaling, and **Logs Insights** over every request. Works without me running anything. |
-| Resolution | 5 s: each 30-second step of the step test shows up as its own level | 1 min: the steps blur into one ramp, and data arrives 2–4 min late |
-| Blind spots | No idea of the task's limits or the platform. If the laptop running Prometheus is off, nothing is recorded. | No request rate or latency for this service (no load balancer). Can't see *why* CPU is high. |
+| What it told me that the other didn't | Request rate, error rate, latency inside the handler, errors by status, and products checked per search. This is the app's view: the search stayed at ~0.1 ms and always checked 100 products. | CPU and memory as a percentage of what the task is allowed (0.25 vCPU, 512 MB), measured by the platform instead of my code. Grafana showed 68 MiB of memory but not that it's only 10% of the limit. Also alarms that can drive scaling, and Logs Insights over every request, without me running anything. |
+| Resolution | 5 s, so each 30-second step of the step test shows up as its own level | 1 min, so the steps blur into one ramp, and the data shows up 2–4 min late |
+| Blind spots | Knows nothing about the task's limits. If my laptop running Prometheus is off, nothing gets recorded. | No request rate or latency for this service yet (no load balancer), and no way to see why CPU is high |
 
-**Together:** CloudWatch says *the task is out of CPU*; Grafana says *the code isn't any slower, requests are just waiting*. That combination points to scaling rather than optimization. They also cross-check each other: my Grafana CPU panel (from `process_cpu_seconds_total`) reads 77% / 99% for Tests 1 and 2, matching CloudWatch's 77.6% / 98.6%.
+Put together, CloudWatch said the task was out of CPU, and Grafana said the code wasn't any slower and requests were just waiting. That combination is what pointed me to scaling instead of optimization. The two also agreed where they overlapped: my Grafana CPU panel (from `process_cpu_seconds_total`) read 77% and 99% for Tests 1 and 2, and CloudWatch read 77.6% and 98.6%.
 
 <details>
 <summary>Test 1 and step test side by side, and the Locust reports</summary>
@@ -114,28 +112,28 @@ Same Test 2 window (20 users). Grafana is on the left, CloudWatch on the right:
 
 ### 5. Creative stress testing
 
-1. **Same test from two places, to separate client limits from server limits.** The first run was from my laptop. It reached only 43 / 162 req/s at 5 / 20 users, with CPU at 3–7% / 17%. That looks exactly like the handout's *"CPU under 40% with 20 users: checking too few products"*. But the products-checked metric proved 100 per search, and latency was flat at ~110 ms (the laptop → us-west-2 round trip) at both loads. **The load generator was the bottleneck, not the server.** Moving Locust to EC2 in the same region gave 17× the throughput at 5 users and exposed the real CPU limit.
+1. **The same test from two places.** My first run was from my laptop and only reached 43 and 162 req/s at 5 and 20 users, with CPU at 3–7% and 17%. That looked exactly like the handout's "CPU under 40% with 20 users means you're checking too few products." But the products-checked metric showed 100 per search, and latency was flat at ~110 ms (the round trip from my laptop to us-west-2) at both loads, so the load generator was the bottleneck, not the server. Moving Locust onto EC2 in the same region gave 17× the throughput at 5 users and exposed the real CPU limit.
 
    ![Laptop run: CloudWatch CPU stays under 20% at 20 users](results/screenshots/laptop_test2_20u_cloudwatch_cpu.png)
 
-2. **Step-load shape** (`locust/step_locustfile.py`): 1 → 2 → 3 → 5 → 10 → 20 → 40 users, 30 s each, to find the knee instead of guessing at two points.
-3. **A correctness probe built into the service:** `search_products_checked_total`, graphed as products checked per search, rules out "checking too many/too few products" while the test runs.
-4. **Log forensics:** Logs Insights percentiles of in-handler time per test, and finding the ~65 ms CPU-throttling gaps in the raw log timeline.
-5. **An automated scaling trigger** (the CloudWatch alarm) exercised by real load, not just designed on paper.
+2. **A step-load test** (`locust/step_locustfile.py`): 1 → 2 → 3 → 5 → 10 → 20 → 40 users, 30 s each, to find the knee instead of guessing from two data points.
+3. **A correctness check built into the service.** I added the `search_products_checked_total` counter and graphed products checked per search, so I could rule out "checking too many or too few products" while a test was running.
+4. **Digging through the logs.** I used Logs Insights for per-test handler percentiles and found the ~65 ms CPU-throttling gaps in the raw log timeline.
+5. **Testing the scaling trigger for real.** I ran load against the CloudWatch alarm instead of just setting it up.
 
 ### Data
 
-Everything behind the numbers above is in [`results/data/`](results/data):
+Everything behind these numbers is in [`results/data/`](results/data):
 
 | File | Contents |
 |---|---|
 | `ec2/test*_stats.csv`, `ec2/test*_stats_history.csv`, `ec2/test*_locust_report.html`, `ec2/test*_summary.txt` | Locust output for Tests 1–3, with start/end times (UTC) |
 | `ec2/test3_step_by_step.csv` | Per-step req/s, latency, CPU, handler p99 |
-| `prometheus_timeseries.csv` | 5 s series for all three tests: CPU, RSS, req/s, handler p50/p99, products checked per search |
-| `cloudwatch_datapoints.csv` | CloudWatch 1 min CPU and memory (average, maximum) |
-| `request_logs.md` | Logs Insights results, CPU-throttling gaps, slow-request lines |
+| `prometheus_timeseries.csv` | 5 s series for all three tests: CPU, memory, req/s, handler p50/p99, products checked per search |
+| `cloudwatch_datapoints.csv` | CloudWatch 1-minute CPU and memory (average, maximum) |
+| `request_logs.md` | Logs Insights results, the CPU-throttling gaps, slow-request lines |
 | `verification_single_search.txt` | Single-search checks before load testing |
-| `laptop/` | The first (laptop) runs |
+| `laptop/` | The first runs, from my laptop |
 
 ---
 
@@ -143,19 +141,19 @@ Everything behind the numbers above is in [`results/data/`](results/data):
 
 ### Setup
 
-Same service and search logic (100,000 products, 100 checked per search). The only code change is `GET /health` for the load balancer.
+The service and search logic are unchanged (100,000 products, 100 checked per search). The only code change is a `GET /health` endpoint for the load balancer.
 
 | | |
 |---|---|
-| Load balancer | ALB on port 80 → target group: **target type IP**, HTTP **8080**, health check **`/health` every 30 s, healthy after 2 passes**, 30 s deregistration delay |
-| Auto scaling | Target tracking on **average service CPU = 70%**, **min 2, max 4** tasks, **300 s** scale-out and scale-in cooldowns |
-| Tasks | Same Fargate size as Part II: 0.25 vCPU, 512 MB |
-| Load | **The Part II breaking-point test (20 users, `search_locustfile.py`)** from EC2 in us-west-2, against the ALB DNS name, held for 20 min so scaling has time to happen |
-| Monitoring | CloudWatch dashboard `CS6650-search-scaling` (infra: per-task CPU, desired/running tasks, healthy targets, ALB requests/latency/errors) **and** the HW5 Grafana dashboard scraping every task, side by side |
+| Load balancer | ALB on port 80 → target group with target type IP, HTTP on 8080, health check on `/health` every 30 s, healthy after 2 passes, 30 s deregistration delay |
+| Auto scaling | Target tracking on average service CPU at 70%, min 2 and max 4 tasks, 300 s scale-out and scale-in cooldowns |
+| Tasks | Same size as Part II: 0.25 vCPU, 512 MB |
+| Load | The Part II breaking-point test (20 users, `search_locustfile.py`) from EC2 in us-west-2 against the ALB's DNS name, held for 20 minutes so there's time for scaling to happen |
+| Monitoring | A CloudWatch dashboard, `CS6650-search-scaling` (per-task CPU, desired/running tasks, healthy targets, ALB requests, latency and errors), next to the HW5 Grafana dashboard scraping every task |
 
 ### Core test: the load that broke Part II
 
-**2,116,975 requests, 0 failures** over 20 minutes, including three task failures I caused during the run.
+The test ran for 20 minutes and served 2,116,975 requests with 0 failures, even though I stopped three tasks in the middle of it.
 
 ![CloudWatch dashboard during the core test, with scaling and failure events marked](results/part3/screenshots/core_cloudwatch.png)
 
@@ -165,95 +163,93 @@ Same service and search logic (100,000 products, 100 checked per search). The on
 |---|---|---|---|---|
 | Throughput | 1,065 req/s | ~1,330 req/s | ~1,820 req/s | ~2,300 req/s |
 | p50 | 1 ms | 1–2 ms | 1–2 ms | 1–2 ms |
-| p95 | 66 ms | 50–54 ms | 24–28 ms | **1–2 ms** |
+| p95 | 66 ms | 50–54 ms | 24–28 ms | 1–2 ms |
 | p99 | 87 ms | ~82 ms | 68–76 ms | 51–59 ms |
 | Service CPU (avg) | ~99% | ~91% | ~83% | 70–77% |
 | Failures | 0 | 0 | 0 | 0 |
 
-Part III latencies are the ALB's `TargetResponseTime` per minute; Part II's are Locust's. The first 3 minutes are exactly the Part II test, now on 2 tasks.
+The Part III latencies are the ALB's per-minute `TargetResponseTime`, and Part II's are from Locust. The first 3 minutes of this run are exactly the Part II test, just on 2 tasks.
 
-**Timeline (UTC), from [`timeline.csv`](results/part3/data/timeline.csv) and [`events.txt`](results/part3/data/events.txt):**
+Timeline (UTC), from [`timeline.csv`](results/part3/data/timeline.csv) and [`events.txt`](results/part3/data/events.txt):
 
 | Time | What happened |
 |---|---|
-| 14:37:32 | 20 users start. 2 tasks at ~91% CPU; p95 ~52 ms |
-| 14:43:36 | `AlarmHigh` (3 datapoints > 70%) → **desired 2 → 3**, ~6 min after load began |
-| 14:44:36 | New task passes 2 health checks → 3 healthy targets (~60 s after the decision) |
-| 14:49:32 | **Resilience: stopped 1 of 3 tasks.** Target group shows it `draining`; ECS starts a replacement immediately |
-| 14:50:32 | Replacement healthy, back to 3 (~60 s) |
-| 14:50:36 | Cooldown over, CPU still > 70% → **desired 3 → 4** |
-| 14:51:21 | 4 healthy targets; p95 drops to 1–2 ms |
-| 14:53:34 | **Stopped 2 of 4 tasks at once.** The 2 survivors carry ~1,300 req/s; ECS replaces both |
+| 14:37:32 | 20 users start. 2 tasks at ~91% CPU, p95 ~52 ms |
+| 14:43:36 | The scale-out alarm (3 minutes above 70%) fires and desired count goes 2 → 3, about 6 min after load started |
+| 14:44:36 | The new task passes 2 health checks, so 3 healthy targets (~60 s after the decision) |
+| 14:49:32 | Resilience test: I stopped 1 of the 3 tasks. The target group shows it as `draining` and ECS starts a replacement |
+| 14:50:32 | Replacement healthy, back to 3 |
+| 14:50:36 | Cooldown is over and CPU is still above 70%, so desired goes 3 → 4 |
+| 14:51:21 | 4 healthy targets, and p95 drops to 1–2 ms |
+| 14:53:34 | I stopped 2 of the 4 tasks at once. The other 2 carry ~1,300 req/s while ECS replaces them |
 | 14:54:43 | 4 healthy again (~70 s). The only visible effect was one minute of p95 at 12 ms |
 | 14:57:35 | Test ends with 0 failures |
 
 ### 1. How horizontal scaling solved the Part II bottleneck
 
-Part II's bottleneck was CPU: one 0.25 vCPU task maxes out at ~1,100 req/s, and beyond that requests queue behind Fargate's CPU throttling (the ~65 ms pauses). Horizontal scaling adds CPU by adding tasks, and the ALB splits requests across them:
+The Part II bottleneck was CPU. One 0.25 vCPU task maxes out around 1,100 req/s, and past that, requests queue up behind Fargate's CPU throttling (the ~65 ms pauses). Horizontal scaling adds CPU by adding tasks, and the ALB splits the requests between them.
 
-- **Load spreads evenly across tasks.** The Grafana *Search requests per task* panel shows each task getting the same share (~650 req/s with 2 tasks, ~600 with 3 or 4).
-- **Capacity adds up.** Throughput went 1,330 → 1,820 → 2,300 req/s as tasks went 2 → 3 → 4, roughly +500 req/s per task, until the 20 users' demand was met.
-- **Latency recovered.** p95 fell from 66 ms (Part II) to 1–2 ms once there was spare CPU, because requests no longer wait for throttled CPU.
-- **Each task does the same work as before.** In-handler latency stayed under ~1.5 ms and products checked stayed at exactly 100 per search. The service got more CPU, not faster code.
-- **Per-task CPU is not perfectly equal, even with equal requests.** With 3 tasks each serving ~600 req/s, CPU read ~97%, ~85% and ~70% (CloudWatch per-task CPU and Grafana). The tasks run on different underlying hosts, so a fixed number of requests costs different amounts of CPU. Target tracking uses the *average*, so the hottest task can still be throttled while the service is "at target".
+The Grafana "Search requests per task" panel shows the ALB giving each task the same share: about 650 req/s each with 2 tasks and about 600 with 3 or 4. Total throughput went from 1,330 to 1,820 to 2,300 req/s as the service went from 2 to 3 to 4 tasks, about +500 req/s per task, until it covered what the 20 users were asking for. Once there was spare CPU, p95 fell from 66 ms in Part II to 1–2 ms. Time inside the handler stayed under ~1.5 ms and products checked stayed at 100 per search the whole time, so the service didn't get faster code, it got more CPU.
+
+One thing I didn't expect: CPU wasn't equal across tasks even though requests were. With 3 tasks each serving ~600 req/s, CPU read about 97%, 85% and 70% (both CloudWatch per-task CPU and Grafana show this). My guess is the tasks landed on different underlying hosts, so the same number of requests costs a different amount of CPU on each. Target tracking only looks at the average, so the hottest task can still be throttled while the service looks like it's at target.
 
 ### 2. Role of each component
 
-| Component | Role here |
+| Component | What it does here |
 |---|---|
-| **Application Load Balancer** | One stable entry point (`CS6650-search-alb-….elb.amazonaws.com`, port 80) in front of a changing set of tasks. Spreads requests across healthy targets (round robin), stops sending to a target that fails health checks, and reports request count, target response time and 5XX errors to CloudWatch. Clients no longer need a task's IP, which changed on every restart in Part II. |
-| **Target group** | The list of tasks the ALB may send to, registered **by IP** (Fargate tasks have no instance ID) on HTTP port 8080. It health-checks every target with `GET /health` every 30 s, and a target takes 2 consecutive passes to become healthy. ECS registers new tasks and deregisters stopped ones automatically. Deregistration lets in-flight requests finish (30 s here). |
-| **Auto scaling (Application Auto Scaling, target tracking)** | Watches the service's average `CPUUtilization` and changes the ECS service's **desired count** (min 2, max 4) to hold it at 70%. It creates two CloudWatch alarms: *AlarmHigh* (3 × 1-min datapoints above 70%) scales out, *AlarmLow* (15 × 1-min below ~63%) scales in. Cooldowns (300 s) stop it reacting to its own last change. |
-| **ECS service** | Turns the desired count into running Fargate tasks, replaces tasks that stop or fail ALB health checks, and wires each task into the target group. |
+| Application Load Balancer | Gives clients one stable address (`CS6650-search-alb-….elb.amazonaws.com`, port 80) in front of a changing set of tasks. It spreads requests across healthy targets, stops sending to a target that fails health checks, and reports request count, target response time and 5XX errors to CloudWatch. In Part II the task's IP changed every time it restarted. |
+| Target group | The set of tasks the ALB can send traffic to, registered by IP since Fargate tasks don't have instance IDs, on HTTP port 8080. It checks each target with `GET /health` every 30 s, and a target needs 2 passes in a row to be healthy. ECS registers new tasks and deregisters stopped ones automatically, and deregistration gives in-flight requests 30 s to finish. |
+| Auto scaling (target tracking) | Watches the service's average `CPUUtilization` and changes the ECS service's desired count (between 2 and 4) to keep it near 70%. It sets up two CloudWatch alarms: one scales out after 3 one-minute datapoints above 70%, and the other scales in after 15 below ~63%. The 300 s cooldowns stop it from reacting to its own last change. |
+| ECS service | Turns the desired count into running Fargate tasks, replaces tasks that stop or fail ALB health checks, and registers each one with the target group. |
 
 ### 3. Horizontal vs. vertical scaling
 
 | | Horizontal (this setup: more 0.25 vCPU tasks) | Vertical (one bigger task, e.g. 1 vCPU) |
 |---|---|---|
-| Ceiling | Max tasks × ~1,100 req/s, raised by changing one number | The largest Fargate size (16 vCPU); one process must also use all those cores |
-| Failure | Losing one task removes 1/N of capacity; the ALB routes around it | Losing the task is a full outage until a replacement starts |
-| Change without downtime | Yes: tasks are added and removed under load | No: a new task size means replacing the task |
-| Speed of scaling | Minutes (alarm + task start + 2 health checks) | Minutes, plus a restart |
-| Extra parts and cost | ALB (~$0.02/h plus usage), health checks, state must not live in one task | Nothing extra; simplest to run and reason about |
-| Fit for this service | Excellent: every task generates the same 100,000 products, so any task can answer any search | Fine until one machine isn't enough or a single failure is unacceptable |
+| Ceiling | Max tasks × ~1,100 req/s, raised by changing one number | The largest Fargate size (16 vCPU), and one process has to be able to use all of it |
+| Failure | Losing a task removes 1/N of capacity and the ALB routes around it | Losing the task is a full outage until a new one starts |
+| Changing capacity | Tasks are added and removed under load with no downtime | A new task size means replacing the task |
+| How fast it reacts | Minutes (alarm, task start, 2 health checks) | Minutes, plus a restart |
+| Extra parts and cost | An ALB (~$0.02/h plus usage), health checks, and no state stored in a single task | Nothing extra; simpler to run and reason about |
+| Fit for this service | Very good: every task generates the same 100,000 products, so any task can answer any search | Fine until one machine isn't enough or a single failure isn't acceptable |
 
-**Caveat this service exposes:** products created with `POST /products/{id}/details` live in one task's memory. Behind the ALB, a later `GET` can land on another task and return 404. Horizontal scaling assumes stateless instances, so the write path would need a shared store (DynamoDB, Redis) first. The search path is already stateless.
+This service also shows the main catch with horizontal scaling. Products created with `POST /products/{id}/details` only exist in the memory of the task that handled the request, so a later `GET` can land on a different task and return 404. The search path is already stateless, but the write path would need a shared store like DynamoDB or Redis before it could scale this way.
 
-### 4. Predicted scaling behaviour for different load patterns
+### 4. Predicted scaling behavior for different load patterns
 
-Predictions from what the Part II step test and this core test measured. A task handles ~1,100 req/s at 100% CPU (~770 at 70%), each user sends ~100–150 req/s, scale-out needs 3 one-minute datapoints above target, and a new task takes ~50–60 s to start and pass 2 health checks.
+These predictions come from the numbers measured in the Part II step test and this core test: a task handles ~1,100 req/s at 100% CPU (~770 at 70%), each user sends ~100–150 req/s, scale-out needs 3 one-minute datapoints above target, and a new task takes ~50–60 s to start and pass 2 health checks.
 
-| Load pattern | Predicted behaviour |
+| Load pattern | Predicted behavior |
 |---|---|
-| **Sudden heavy load** (the core test: 20 users at once) | Measured: ~6 min of degraded p95/p99 before the first new task, then one task per cooldown (300 s), so reaching 4 tasks takes ~13 min. The cooldown, not detection, sets the pace. |
-| **Gradual ramp** | Scaling keeps up: CPU crosses 70% while there is still headroom below 100%, so new tasks arrive before latency degrades much. Steps happen roughly every time load grows by ~770 req/s. |
-| **Spike from quiet** (2 → 40 users) | The worst case: the 2 minimum tasks saturate immediately, and it takes ~5–6 min for the first new task and ~11 min to reach max 4. At 40 users even 4 tasks are short (40 × ~130 ≈ 5,200 req/s vs ~4,400), so CPU stays pinned and latency stays high at max capacity. Fixes: a higher minimum, step scaling for big jumps, or a higher max. |
-| **Short bursts (< 3 min)** | No scaling at all: the alarm needs 3 consecutive minutes above target. Only the minimum capacity matters. |
-| **Load drops** | Scale-in is deliberately slow: 15 min below ~63% CPU, then one task per 300 s cooldown, never below 2. |
-| **Policy changes** | A **50% target** scales out sooner and runs more tasks (lower latency, more cost); **90%** waits until tasks are nearly saturated, which on 0.25 vCPU means the CPU-throttling latency (~65 ms) is already showing. **Shorter cooldowns** reach max capacity faster under heavy load but risk overshooting; **min 3–4** absorbs spikes without waiting. |
+| Sudden heavy load (the core test: 20 users at once) | Measured: about 6 minutes of degraded p95/p99 before the first new task, then one more task per 300 s cooldown, so about 13 minutes to reach 4 tasks. The cooldown sets the pace more than detection does. |
+| Gradual ramp | Scaling should keep up, because CPU crosses 70% while there's still headroom before 100%, so new tasks arrive before latency gets much worse. A new task would get added roughly every time load grows by ~770 req/s. |
+| Spike from quiet (2 → 40 users) | The worst case. The 2 minimum tasks saturate right away, the first new task takes 5–6 minutes, and reaching 4 takes about 11. Even 4 tasks aren't enough for 40 users (40 × ~130 ≈ 5,200 req/s vs. ~4,400 capacity), so CPU stays pinned and latency stays high at max capacity. A higher minimum, step scaling for big jumps, or a higher max would help. |
+| Short bursts (under 3 min) | No scaling at all, since the alarm needs 3 straight minutes above target. Only the minimum task count matters. |
+| Load drops | Scale-in is slow on purpose: 15 minutes below ~63% CPU, then one task per 300 s cooldown, and never below 2. |
+| Policy changes | A 50% target would scale out sooner and run more tasks (lower latency, higher cost). A 90% target waits until tasks are almost saturated, and on 0.25 vCPU that means the ~65 ms throttling latency is already showing. Shorter cooldowns would reach max capacity faster but could overshoot, and a minimum of 3–4 tasks would absorb spikes without waiting. |
 
 ### 5. CPU vs. a request metric as the scaling trigger
 
-What the two dashboards showed during the scale-out:
+Here's what each signal showed during the scale-out:
 
-- **CPU (CloudWatch):** above 70% from the first full minute (14:38, 92%). The scale-out came at 14:43:36: 3 one-minute datapoints, plus ~2–3 min of CloudWatch publishing delay.
-- **User-facing latency (ALB `TargetResponseTime`, Locust):** p95 was already ~52 ms in the first minute too. It's flat until a task saturates and then jumps (Part II step test: 1 ms up to 5 users, 30–70 ms after), so it says "already saturated" rather than "getting close".
-- **In-handler duration (HW5 Grafana):** p99 only moved from ~0.4 ms to ~1.5 ms. The time is spent *waiting* for CPU, outside the handler, so a trigger on app-level request duration would **never** have fired.
-- **Requests per target (Grafana per-task panel, ALB `RequestCountPerTarget`):** ~650 req/s per task from the first minute, steady and proportional to CPU, because every search costs the same.
+- CloudWatch CPU was above 70% from the first full minute (14:38, 92%). The scale-out happened at 14:43:36, after 3 one-minute datapoints plus 2–3 minutes of CloudWatch delay.
+- User-facing latency (the ALB's `TargetResponseTime` and Locust) was also bad in the first minute, with p95 around 52 ms. Latency stays flat until a task saturates and then jumps (in the Part II step test it was 1 ms up to 5 users, then 30–70 ms), so it tells you a task is already saturated, not that it's getting close.
+- In-handler duration on the HW5 Grafana dashboard only went from ~0.4 ms to ~1.5 ms p99. The time was being spent waiting for CPU outside the handler, so a trigger on app-level request duration would never have fired.
+- Requests per target (the Grafana per-task panel and the ALB's `RequestCountPerTarget`) was ~650 req/s per task from the first minute, steady and proportional to CPU, because every search costs the same.
 
-**Sooner or later?** A latency or request-count trigger would not have scaled meaningfully *sooner*. All three CloudWatch signals crossed their thresholds in the same first minute, and the delay comes from the alarm mechanics (3 datapoints, publishing lag, cooldown), not the metric. A trigger on in-handler duration would have been *later*: never.
+So a latency or request-count trigger wouldn't have scaled much sooner. All three CloudWatch signals crossed their thresholds in the same first minute, and most of the delay came from how the alarm works (3 datapoints, publishing lag, cooldown), not from which metric it watched. A trigger on in-handler duration would have been later; it would never have fired.
 
-**My pick for this workload: CPU, or equivalently `ALBRequestCountPerTarget`.** This is fixed-cost CPU-bound work, so CPU measures the actual bottleneck, and request count per target is a linear proxy for it (~770 req/s per task ≈ 70% CPU). Request count has two advantages: it doesn't vary with which Fargate host a task lands on (CPU did: 70–97% for equal requests), and it predicts saturation before latency moves. Latency stays as an SLO alarm rather than the scaling trigger: it reacts only after users are hurt, and it would also fire for causes more tasks don't fix (network, a slow dependency).
+For this workload I'd stick with CPU, or switch to `ALBRequestCountPerTarget`, which is basically the same signal here. The work is fixed-cost and CPU-bound, so CPU measures the actual bottleneck, and request count per target tracks it in a straight line (~770 req/s per task ≈ 70% CPU). Request count has two advantages: it doesn't depend on which host a task lands on (CPU ranged from 70% to 97% for the same request rate), and it shows saturation coming before latency moves. I'd keep latency as an alert on user experience rather than the scaling trigger, since it only reacts after users are already affected and it can rise for reasons more tasks won't fix, like the network or a slow dependency.
 
 ### 6. Resilience and creative stress testing (exploration)
 
 | Experiment | What I did | What happened |
 |---|---|---|
-| **Stop one task under load** (the assignment's resilience test) | 14:49:32, stopped 1 of 3 tasks with `aws ecs stop-task` (same as **Stop** in the console) | Target group marked it `draining` within ~15 s; the ALB stopped routing to it. ECS started a replacement right away, which was healthy ~60 s later. **0 failed requests**; p95/p99 barely moved. |
-| **Stop several tasks at once** | 14:53:34, stopped 2 of 4 tasks together | Throughput dipped to what 2 tasks can serve (~1,300 req/s) for ~1 min while ECS replaced both; 4 healthy again after ~70 s. **0 failed requests**; one minute of p95 at 12 ms. |
-| **Make every task fail its health check** | 14:59:23, pointed the health check at `/does-not-exist` under the same 20-user load; restored `/health` at 15:03:23 | ~90 s later **all 4 targets were unhealthy, yet the ALB kept returning 200**: when no target is healthy, an ALB *fails open* and routes to all of them. ECS treated the unhealthy tasks as failed and **replaced them over and over**: it started new tasks first (up to 8 running), then stopped the old ones, and the new ones failed the same broken check. After the fix, targets were healthy within ~40 s and the extra tasks drained. **866,930 requests, 0 failures, no ALB 5XX.** Lesson: a bad health check doesn't cause an outage here, but it causes constant task churn, and with a genuinely broken app, failing open would send users to broken tasks. |
-| **Extended duration** | Held the Part II load for 20 min instead of 3 | Needed to see scaling at all: the first scale-out came at minute 6 and max capacity at minute 14. A 3-minute test ends before any scaling happens. |
-| **Load generator inside AWS** (from Part II) | Locust on EC2 in the same region (2 processes) | Keeps the load generator from being the bottleneck: it sustained ~2,300 req/s through the ALB with 2 ms medians. |
+| Stop one task under load (the resilience test) | At 14:49:32, stopped 1 of 3 tasks with `aws ecs stop-task` (same as Stop in the console) | Within ~15 s the target group marked it `draining` and the ALB stopped routing to it. ECS started a replacement right away, and it was healthy ~60 s later. 0 failed requests, and p95/p99 barely moved. |
+| Stop several tasks at once | At 14:53:34, stopped 2 of 4 tasks together | Throughput dropped to what 2 tasks can serve (~1,300 req/s) for about a minute while ECS replaced both, and all 4 were healthy again after ~70 s. 0 failed requests, and one minute of p95 at 12 ms. |
+| Make every task fail its health check | At 14:59:23, pointed the health check at `/does-not-exist` under the same 20-user load, then restored `/health` at 15:03:23 | About 90 s later all 4 targets were unhealthy, but the ALB kept returning 200s. When no targets are healthy, an ALB "fails open" and routes to all of them anyway. Meanwhile ECS treated the unhealthy tasks as failed and kept replacing them: it started new tasks first (up to 8 running), then stopped the old ones, and the new ones failed the same broken check. After I fixed the path, targets were healthy within ~40 s and the extra tasks drained. 866,930 requests, 0 failures, no ALB 5XX errors. So a bad health check didn't cause an outage here, but it caused constant task churn, and if the app were actually broken, failing open would send users to broken tasks. |
+| Longer test | Held the Part II load for 20 minutes instead of 3 | This was necessary to see scaling at all. The first scale-out came at minute 6 and max capacity at minute 14, so a 3-minute test ends before anything scales. |
+| Load generator inside AWS (carried over from Part II) | Locust on EC2 in the same region, with 2 processes | Kept the load generator from being the bottleneck. It sustained ~2,300 req/s through the ALB with 2 ms medians. |
 
 ![CloudWatch while every health check failed: unhealthy targets and task churn, but no errors](results/part3/screenshots/healthfail_cloudwatch.png)
 
@@ -264,9 +260,12 @@ What the two dashboards showed during the scale-out:
 
 </details>
 
-**Policy and load-shape variations:** the gradual-ramp and spike shapes are in `locust/ramp_locustfile.py` and `locust/spike_locustfile.py`, and the CPU target, min/max and cooldowns are Terraform variables (`terraform apply -var cpu_target=50 -var scale_out_cooldown=60`). Section 4 predicts how each one would behave, based on the measured capacity and scaling timings.
+The gradual-ramp and spike load shapes are in `locust/ramp_locustfile.py` and `locust/spike_locustfile.py`, and the CPU target, min/max and cooldowns are Terraform variables (`terraform apply -var cpu_target=50 -var scale_out_cooldown=60`). Section 4 covers how I expect each of those to behave based on the measured capacity and scaling timings.
 
-**Takeaway:** the service now handles the load that broke it in Part II, with 0 errors and p95 back to 1–2 ms at 4 tasks, and it survives losing half its tasks mid-test. Adding identical stateless instances behind a load balancer, with health checks and auto scaling deciding how many, is how most modern distributed services handle both growth and failure.
+### Summary
+
+The service now handles the load that broke it in Part II, with 0 errors and p95 back down to 1–2 ms at 4 tasks, and it kept serving requests while I stopped half its tasks. The single-task bottleneck from Part II became a capacity setting: the ALB spreads requests across identical tasks, health checks route around failures, and auto scaling decides how many tasks to run based on CPU.
+
 
 ---
 
